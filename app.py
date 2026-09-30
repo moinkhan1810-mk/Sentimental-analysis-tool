@@ -1,11 +1,9 @@
 """
-Polite Response Generator (T5-small fine-tuned on tweet_eval sentiment)
+Polite Response Generator (T5-small fine-tuned on tweet_eval sentiment) - Streamlit
 
-Pipeline: Data loading -> Cleaning -> Formatting -> Tokenization -> Training -> Inference (Gradio UI)
-
-Run:  python app.py
-On first run it fine-tunes T5-small on ~100 tweets and saves the model to ./t5_polite_model.
-Later runs load the saved model directly.
+Run:  streamlit run app.py
+Pehli baar "Train model" button dabayein (~100 samples, jaldi ho jata hai).
+Model ./t5_polite_model mein save hota hai, phir agli baar direct load hota hai.
 """
 
 import os
@@ -14,7 +12,7 @@ import html
 import random
 
 import torch
-import gradio as gr
+import streamlit as st
 from datasets import load_dataset
 from transformers import (
     T5ForConditionalGeneration,
@@ -22,6 +20,7 @@ from transformers import (
     DataCollatorForSeq2Seq,
     TrainingArguments,
     Trainer,
+    TrainerCallback,
     set_seed,
 )
 
@@ -41,10 +40,7 @@ RESPONSES = {
     2: "Thank you so much for your kind words! We truly appreciate your support.",
 }
 
-set_seed(SEED)
-random.seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
 
 # --------------------------------------------------------------------------- #
 # Cleaning
@@ -73,6 +69,7 @@ def make_prompt(cleaned: str) -> str:
 # --------------------------------------------------------------------------- #
 # Data
 # --------------------------------------------------------------------------- #
+@st.cache_resource(show_spinner="Dataset load ho raha hai...")
 def load_data():
     try:
         raw = load_dataset("cardiffnlp/tweet_eval", "sentiment")
@@ -97,9 +94,25 @@ def load_data():
 
 
 # --------------------------------------------------------------------------- #
-# Training
+# Training (with live logs in the UI)
 # --------------------------------------------------------------------------- #
-def train_model(splits, tokenizer):
+class StreamlitLogCallback(TrainerCallback):
+    def __init__(self, progress_bar, log_box):
+        self.progress_bar = progress_bar
+        self.log_box = log_box
+        self.lines = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs:
+            self.lines.append(f"step {state.global_step}/{state.max_steps}: {logs}")
+            self.log_box.code("\n".join(self.lines[-15:]))
+        if state.max_steps:
+            self.progress_bar.progress(min(state.global_step / state.max_steps, 1.0))
+
+
+def train_model(splits, progress_bar, log_box):
+    set_seed(SEED)
+    tokenizer = T5TokenizerFast.from_pretrained(MODEL_NAME)
     model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
 
     def tokenize_fn(batch):
@@ -123,6 +136,7 @@ def train_model(splits, tokenizer):
         eval_strategy="epoch",
         save_strategy="no",
         report_to="none",
+        disable_tqdm=True,
         seed=SEED,
     )
     trainer = Trainer(
@@ -131,19 +145,27 @@ def train_model(splits, tokenizer):
         train_dataset=train_tok,
         eval_dataset=val_tok,
         data_collator=DataCollatorForSeq2Seq(tokenizer, model=model, label_pad_token_id=-100),
+        callbacks=[StreamlitLogCallback(progress_bar, log_box)],
     )
     trainer.train()
     trainer.save_model(SAVE_DIR)
     tokenizer.save_pretrained(SAVE_DIR)
-    print(f"Saved fine-tuned model to {SAVE_DIR}")
 
 
 # --------------------------------------------------------------------------- #
 # Inference
 # --------------------------------------------------------------------------- #
+@st.cache_resource(show_spinner="Models load ho rahe hain...")
+def load_models():
+    tokenizer = T5TokenizerFast.from_pretrained(SAVE_DIR)
+    base_model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
+    ft_model = T5ForConditionalGeneration.from_pretrained(SAVE_DIR).to(device)
+    return tokenizer, base_model, ft_model
+
+
 def generate(model, tokenizer, prompt: str, max_new_tokens: int = 48) -> str:
     model.eval()
-    dev = next(model.parameters()).device
+    dev = next(model.parameters()).device  # hamesha model ke device par
     enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_INPUT_LEN)
     enc = {k: v.to(dev) for k, v in enc.items()}
     with torch.no_grad():
@@ -152,55 +174,68 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int = 48) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Startup: data, models
+# UI
 # --------------------------------------------------------------------------- #
+st.set_page_config(page_title="Polite Response Generator", page_icon="💬")
+st.title("💬 Polite Response Generator")
+st.caption(
+    "T5-small fine-tuned on tweet_eval sentiment. "
+    "Negative → apology, Neutral → clarification, Positive → appreciation."
+)
+st.sidebar.write(f"Device: **{device}**")
+
 splits = load_data()
 test_ds = splits["test"]
 
+# ---- Training section ----
 if not os.path.isdir(SAVE_DIR):
-    train_model(splits, T5TokenizerFast.from_pretrained(MODEL_NAME))
+    st.warning("Fine-tuned model abhi nahi mila. Pehle train karein.")
+    if st.button("🚀 Train model", type="primary"):
+        progress = st.progress(0.0)
+        log_box = st.empty()
+        with st.spinner("Training chal rahi hai..."):
+            train_model(splits, progress, log_box)
+        st.success("Training complete! Model save ho gaya.")
+        st.rerun()
+    st.stop()
 
-tokenizer = T5TokenizerFast.from_pretrained(SAVE_DIR)
-base_model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
-ft_model = T5ForConditionalGeneration.from_pretrained(SAVE_DIR).to(device)
+tokenizer, base_model, ft_model = load_models()
+
+# ---- Inference section ----
+if "tweet" not in st.session_state:
+    st.session_state["tweet"] = ""
+    st.session_state["true_label"] = ""
 
 
-# --------------------------------------------------------------------------- #
-# UI
-# --------------------------------------------------------------------------- #
-def sample_tweet():
+def load_random_tweet():
     ex = test_ds[random.randrange(len(test_ds))]
-    return ex["text"], LABEL_NAMES[ex["label"]]
+    st.session_state["tweet"] = ex["text"]
+    st.session_state["true_label"] = LABEL_NAMES[ex["label"]]
 
 
-def respond(tweet: str):
+st.button("🎲 Load random test tweet (dataset se)", on_click=load_random_tweet)
+
+tweet = st.text_area("Tweet", key="tweet", height=100)
+if st.session_state["true_label"]:
+    st.write(f"True sentiment (dataset): **{st.session_state['true_label']}**")
+
+if st.button("Generate", type="primary"):
     cleaned = clean_text(tweet or "")
     if not cleaned:
-        return "", "(empty after cleaning)", "(empty after cleaning)"
-    prompt = make_prompt(cleaned)
-    return (
-        cleaned,
-        generate(base_model, tokenizer, prompt),
-        generate(ft_model, tokenizer, prompt),
-    )
+        st.error("Cleaning ke baad text khali ho gaya. Koi doosra tweet try karein.")
+    else:
+        prompt = make_prompt(cleaned)
+        with st.spinner("Generating..."):
+            before = generate(base_model, tokenizer, prompt)
+            after = generate(ft_model, tokenizer, prompt)
 
+        st.subheader("Cleaned text")
+        st.code(cleaned, language=None)
 
-with gr.Blocks(title="Polite Response Generator") as demo:
-    gr.Markdown("# Polite Response Generator\nT5-small fine-tuned on tweet_eval sentiment. "
-                "Negative → apology, Neutral → clarification, Positive → appreciation.")
-    with gr.Row():
-        tweet_box = gr.Textbox(label="Tweet", lines=3, scale=4)
-        true_label = gr.Textbox(label="True sentiment (from dataset)", interactive=False, scale=1)
-    with gr.Row():
-        sample_btn = gr.Button("Load random test tweet")
-        run_btn = gr.Button("Generate", variant="primary")
-    cleaned_box = gr.Textbox(label="Cleaned text", interactive=False)
-    with gr.Row():
-        before_box = gr.Textbox(label="Before fine-tuning (base t5-small)", lines=4, interactive=False)
-        after_box = gr.Textbox(label="After fine-tuning", lines=4, interactive=False)
-
-    sample_btn.click(sample_tweet, outputs=[tweet_box, true_label])
-    run_btn.click(respond, inputs=tweet_box, outputs=[cleaned_box, before_box, after_box])
-
-if __name__ == "__main__":
-    demo.launch()
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Before fine-tuning")
+            st.info(before or "(empty output)")
+        with col2:
+            st.subheader("After fine-tuning")
+            st.success(after or "(empty output)")
